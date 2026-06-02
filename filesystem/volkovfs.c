@@ -9,6 +9,7 @@
 #include <linux/stat.h>
 #include <linux/blkdev.h>
 #include <linux/time.h>
+#include <linux/dcache.h>
 
 #include "volkovfs.h"
 
@@ -72,6 +73,22 @@ static uint32_t volkovfs_compute_checksum(struct volkovfs_disk_sb *dsb)
     sum ^= le32_to_cpu(dsb->total_sectors);
 
     return sum;
+}
+
+static int volkovfs_sb_is_blank(const struct volkovfs_disk_sb *dsb)
+{
+    const unsigned char *p = (const unsigned char *)dsb;
+    size_t i;
+
+    for (i = 0; i < sizeof(*dsb); i++)
+    {
+        if (p[i] != 0)
+        {
+            return 0;
+        }
+    }
+
+    return 1;
 }
 
 static uint32_t volkovfs_djb2_hash(const unsigned char *data, size_t len)
@@ -248,11 +265,14 @@ static int volkovfs_iterate(struct file *filp, struct dir_context *ctx)
     {
         int name_len;
 
-        name_len = snprintf(name_buf, sizeof(name_buf), "file_%04u", file_idx);
-
-        if (!dir_emit(ctx, name_buf, name_len, VOLKOVFS_FILE_INO_BASE + file_idx, DT_REG))
+        if (sbi->file_sizes[file_idx] > 0)
         {
-            return 0;
+            name_len = snprintf(name_buf, sizeof(name_buf), "file_%04u", file_idx);
+
+            if (!dir_emit(ctx, name_buf, name_len, VOLKOVFS_FILE_INO_BASE + file_idx, DT_REG))
+            {
+                return 0;
+            }
         }
 
         file_idx++;
@@ -571,6 +591,11 @@ static long volkovfs_ioctl_zero(struct super_block *sb)
 
     memset(sbi->file_sizes, 0, sbi->total_files * sizeof(uint32_t));
 
+    if (sb->s_root)
+    {
+        shrink_dcache_parent(sb->s_root);
+    }
+
     pr_info("volkovfs: обнуление завершено\n");
     return 0;
 }
@@ -643,8 +668,6 @@ static int volkovfs_fill_super(struct super_block *sb, void *data, int silent)
     struct volkovfs_disk_sb *dsb;
     struct buffer_head *bh;
     struct inode *root_inode;
-    uint32_t checksum;
-    int formatted = 0;
 
     if (!sb_set_blocksize(sb, VOLKOVFS_SECTOR_SIZE)) 
     {
@@ -673,49 +696,59 @@ static int volkovfs_fill_super(struct super_block *sb, void *data, int silent)
 
     dsb = (struct volkovfs_disk_sb *)bh->b_data;
 
-    if (le32_to_cpu(dsb->magic) != VOLKOVFS_MAGIC) 
+    if (le32_to_cpu(dsb->magic) == VOLKOVFS_MAGIC &&
+        le32_to_cpu(dsb->checksum) == volkovfs_compute_checksum(dsb))
     {
-        brelse(bh);
-
-        if (!silent)
-            pr_info("volkovfs: суперблок не найден, форматирование...\n");
-
-        if (volkovfs_format_device(sb) != 0)
-            goto fail_sbi;
-
-        formatted = 1;
-
-        bh = sb_bread(sb, sb_offset1);
-        if (!bh)
-        {
-            goto fail_sbi;
-        }
-        dsb = (struct volkovfs_disk_sb *)bh->b_data;
+        goto sb_ready;
     }
-
-    checksum = volkovfs_compute_checksum(dsb);
-    if (!formatted && le32_to_cpu(dsb->checksum) != checksum) 
+    else
     {
-        pr_warn("volkovfs: несовпадение контрольной суммы в SB1, пробуем SB2...\n");
+        int sb1_blank = volkovfs_sb_is_blank(dsb);
+
         brelse(bh);
 
         bh = sb_bread(sb, sb_offset2);
         if (!bh)
         {
+            pr_err("volkovfs: не удалось прочитать сектор %d\n", sb_offset2);
             goto fail_sbi;
         }
         dsb = (struct volkovfs_disk_sb *)bh->b_data;
 
-        if (le32_to_cpu(dsb->magic) != VOLKOVFS_MAGIC ||
-            le32_to_cpu(dsb->checksum) != volkovfs_compute_checksum(dsb)) 
+        if (le32_to_cpu(dsb->magic) == VOLKOVFS_MAGIC &&
+            le32_to_cpu(dsb->checksum) == volkovfs_compute_checksum(dsb))
         {
-            pr_err("volkovfs: обе копии суперблока повреждены!\n");
-            brelse(bh);
-            goto fail_sbi;
+            pr_info("volkovfs: первая копия суперблока повреждена, "
+                    "использована вторая копия\n");
+            goto sb_ready;
         }
-        pr_info("volkovfs: использована вторая копия суперблока\n");
+
+        if (sb1_blank && volkovfs_sb_is_blank(dsb))
+        {
+            brelse(bh);
+
+            if (!silent)
+                pr_info("volkovfs: суперблок не найден, форматирование...\n");
+
+            if (volkovfs_format_device(sb) != 0)
+                goto fail_sbi;
+
+            bh = sb_bread(sb, sb_offset1);
+            if (!bh)
+            {
+                goto fail_sbi;
+            }
+            dsb = (struct volkovfs_disk_sb *)bh->b_data;
+            goto sb_ready;
+        }
+
+        pr_err("volkovfs: обе копии суперблока повреждены, "
+               "монтирование невозможно\n");
+        brelse(bh);
+        goto fail_corrupt;
     }
 
+sb_ready:
     sbi->total_files = le32_to_cpu(dsb->total_files);
     sbi->max_file_sectors = le32_to_cpu(dsb->max_file_sectors);
     sbi->max_name_len = le32_to_cpu(dsb->max_name_len);
@@ -756,6 +789,11 @@ fail_sbi:
     kfree(sbi);
     sb->s_fs_info = NULL;
     return -ENOMEM;
+
+fail_corrupt:
+    kfree(sbi);
+    sb->s_fs_info = NULL;
+    return -EUCLEAN;
 }
 
 static struct dentry *volkovfs_mount(struct file_system_type *fs_type, int flags,
